@@ -1006,6 +1006,7 @@ error:
 	return result;
 }
 
+
 /**
  * homa_recvmsg() - Receive a message from a Homa socket.
  * @sk:          Socket on which the system call was invoked.
@@ -1150,20 +1151,281 @@ done:
 	return result;
 }
 
+
+
+
 /**
- * homa_sendpage() - ??.
- * @sk:     Socket for the operation
- * @page:   ??
- * @offset: ??
- * @size:   ??
- * @flags:  ??
+ * homa_no_sendpage() - Send a page when the system does not support scatter-gather I/O; 
+ *						Convert the page into a message for sending.
+ * @sk:     Socket on which the system call was invoked.
+ * @page:   Pointer to a memory page.
+ * @offset: Specifies the starting position on the page from which data is sent.
+ * @size:   The size of the data to be sent
+ * @flags:  Flags to control the behavior of the sending operation.
+ * Return:  0 on success, otherwise a negative errno.
+ */
+int homa_no_sendpage(struct sock *sk, struct page *page, int offset,
+		  size_t size, int flags) {
+	struct homa_sock *hsk = homa_sk(sk);
+	struct homa_sendmsg_args args;
+	__u64 start = get_cycles();
+	__u64 finish;
+	int result = 0;
+	struct homa_rpc *rpc = NULL;
+
+	// Set addr struct
+	sockaddr_in_union *addr = kmalloc(sizeof(sockaddr_in_union), GFP_KERNEL);
+    if (!addr) {
+        goto error; 
+    }
+
+    memset(addr, 0, sizeof(sockaddr_in_union));
+	memset(&args, 0, sizeof(args));
+
+	homa_cores[raw_smp_processor_id()]->last_app_active = start;
+
+	// Get IP address and port from socket and convert it to addr
+	if (sk->sk_family == AF_INET) {  // IPv4
+    	if (!inet_sk(sk)->inet_dport) {
+        	result = -EAFNOSUPPORT;
+			goto error;
+		}
+    	if (!inet_sk(sk)->inet_daddr) {
+        	result = -EAFNOSUPPORT;
+			goto error;
+    	}
+   		addr->in4.sin_family = AF_INET;
+    	addr->in4.sin_port = inet_sk(sk)->inet_dport;  
+    	addr->in4.sin_addr.s_addr = inet_sk(sk)->inet_daddr;  
+		} else if (sk->sk_family == AF_INET6) {  // IPv6
+    	if (!sk->sk_dport) {
+        	result = -EAFNOSUPPORT;
+			goto error;
+    	}
+    	if (memcmp(&inet6_sk(sk)->saddr, &in6addr_any, sizeof(struct in6_addr)) == 0) {
+        	result = -EAFNOSUPPORT;
+			goto error;
+    	}
+    	addr->in6.sin6_family = AF_INET6;
+    	addr->in6.sin6_port = htons(sk->sk_dport);  
+    	memcpy(&addr->in6.sin6_addr, &inet6_sk(sk)->saddr, sizeof(struct in6_addr));  
+		}
+	
+
+	if (addr->in6.sin6_family != sk->sk_family) {
+		result = -EAFNOSUPPORT;
+		goto error;
+	}
+
+	/* sendpage() is a request. Create a new rpc. */
+	rpc = homa_rpc_new_client(hsk, addr);
+	if (IS_ERR(rpc)) {
+		result = PTR_ERR(rpc);
+		rpc = NULL;
+		goto error;
+	}
+		
+	INC_METRIC(send_calls, 1);
+	tt_record4("homa_sendpage request, target 0x%x:%d, id %u, length %d",
+				(addr->in6.sin6_family == AF_INET)
+				? ntohl(addr->in4.sin_addr.s_addr)
+				: tt_addr(addr->in6.sin6_addr),
+				ntohs(addr->in6.sin6_port), rpc->id,
+				size);
+
+	rpc->completion_cookie = args.completion_cookie;
+	
+	/*Create an empty message*/
+	struct msghdr msg = {0}; 
+	msg.msg_flags = flags;  
+	
+	// Declare a kernel vector for simulating scatter-gather I/O
+	struct kvec iov;
+	
+	/* Map the page into kernel space */
+	char *kaddr = kmap(page);
+	if (!kaddr) {
+    	result = -ENOMEM;
+		goto error;
+	}
+
+	iov.iov_base = kaddr + offset;
+	iov.iov_len = size;
+
+	/* Initialize iterator*/
+	iov_iter_kvec(&msg.msg_iter, ITER_SOURCE, &iov, 1, size);
+
+	/*After converting the 'page' to 'msg', call the data processing and sending function of 'sendmsg'. */
+	result = homa_message_out_fill(rpc, &msg.msg_iter, 1);
+
+	/* Unmap the page from kernel space after use */
+	kunmap(page);
+	
+	if (result)
+		goto error;
+	args.id = rpc->id;
+	homa_rpc_unlock(rpc);
+	rpc = NULL;
+
+	finish = get_cycles();
+	INC_METRIC(send_cycles, finish - start);
+
+	if (addr != NULL) {
+    	kfree(addr);
+    	addr = NULL; 
+	}
+	tt_record1("homa_sendpage finished, id %d", args.id);
+	return 0;
+
+error:
+	if (rpc) {
+		homa_rpc_free(rpc);
+		homa_rpc_unlock(rpc);
+	}
+	if (addr != NULL) {
+    kfree(addr);
+    addr = NULL; 
+	}
+	tt_record2("homa_sendpage returning error %d for id %d",
+			result, args.id);
+	tt_freeze();
+	return result;
+
+}
+
+
+/**
+ * do_homa_sendpage() - Send a page when the system support scatter-gather I/O.
+ * @sk:     Socket on which the system call was invoked.
+ * @page:   Pointer to a memory page.
+ * @offset: Specifies the starting position on the page from which data is sent.
+ * @size:   The size of the data to be sent
+ * @flags:  Flags to control the behavior of the sending operation.
+ * Return:  0 on success, otherwise a negative errno.
+ */
+int do_homa_sendpage(struct sock *sk, struct page *page, int offset,
+		  size_t size, int flags) {
+	struct homa_sock *hsk = homa_sk(sk);
+	struct homa_sendmsg_args args;
+	__u64 start = get_cycles();
+	__u64 finish;
+	int result = 0;
+	struct homa_rpc *rpc = NULL;
+
+	// Set addr struct
+	sockaddr_in_union *addr = kmalloc(sizeof(sockaddr_in_union), GFP_KERNEL);
+    if (!addr) {
+        goto error;  
+    }
+
+    memset(addr, 0, sizeof(sockaddr_in_union));
+	memset(&args, 0, sizeof(args));
+
+	// Get IP address and port from socket and convert it to addr
+	homa_cores[raw_smp_processor_id()]->last_app_active = start;
+	if (sk->sk_family == AF_INET) {  // IPv4
+    	if (!inet_sk(sk)->inet_dport) {
+        	result = -EAFNOSUPPORT;
+			goto error;
+    	}
+    	if (!inet_sk(sk)->inet_daddr) {
+        	result = -EAFNOSUPPORT;
+			goto error;
+    	}
+    	addr->in4.sin_family = AF_INET;
+    	addr->in4.sin_port = inet_sk(sk)->inet_dport;  
+    	addr->in4.sin_addr.s_addr = inet_sk(sk)->inet_daddr;  
+	} else if (sk->sk_family == AF_INET6) {  // IPv6
+    	if (!sk->sk_dport) {
+        	result = -EAFNOSUPPORT;
+			goto error;
+    	}
+    	if (memcmp(&inet6_sk(sk)->saddr, &in6addr_any, sizeof(struct in6_addr)) == 0) {
+        	result = -EAFNOSUPPORT;
+			goto error;
+    	}
+    	addr->in6.sin6_family = AF_INET6;
+    	addr->in6.sin6_port = htons(sk->sk_dport);  
+    	memcpy(&addr->in6.sin6_addr, &inet6_sk(sk)->saddr, sizeof(struct in6_addr));  
+	}
+
+	if (addr->in6.sin6_family != sk->sk_family) {
+		result = -EAFNOSUPPORT;
+		goto error;
+	}
+
+	/* sendpage() is a request message. Create a new rpc */
+	rpc = homa_rpc_new_client(hsk, addr);
+	if (IS_ERR(rpc)) {
+		result = PTR_ERR(rpc);
+		rpc = NULL;
+		goto error;
+	}
+		
+	INC_METRIC(send_calls, 1);
+	tt_record4("homa_sendpage request, target 0x%x:%d, id %u, length %d",
+				(addr->in6.sin6_family == AF_INET)
+				? ntohl(addr->in4.sin_addr.s_addr)
+				: tt_addr(addr->in6.sin6_addr),
+				ntohs(addr->in6.sin6_port), rpc->id,
+				size);
+
+	rpc->completion_cookie = args.completion_cookie;
+
+	result = homa_page_out_fill(rpc, page, offset,size, 1);
+
+	if (result)
+		goto error;
+	args.id = rpc->id;
+	homa_rpc_unlock(rpc);
+	rpc = NULL;
+
+	finish = get_cycles();
+	INC_METRIC(send_cycles, finish - start);
+
+	if (addr != NULL) {
+    	kfree(addr);
+    	addr = NULL; 
+	}
+	tt_record1("homa_sendpage finished, id %d", args.id);
+	return 0;
+
+error:
+	if (rpc) {
+		homa_rpc_free(rpc);
+		homa_rpc_unlock(rpc);
+	}
+	if (addr != NULL) {
+    kfree(addr);
+    addr = NULL;
+	}
+	tt_record2("homa_sendpage returning error %d for id %d",
+			result, args.id);
+	tt_freeze();
+	return result;
+}
+
+/**
+ * homa_sendpage() - Send a page on a Homa socket. 
+ *					If the socket supports scatter-gather I/O, then call do_homa_sendpage; 
+ 					otherwise, call homa_no_sendpage.
+ * @sk:     Socket on which the system call was invoked.
+ * @page:   Pointer to a memory page.
+ * @offset: Specifies the starting position on the page from which data is sent.
+ * @size:   The size of the data to be sent
+ * @flags:  Flags to control the behavior of the sending operation.
  * Return:  0 on success, otherwise a negative errno.
  */
 int homa_sendpage(struct sock *sk, struct page *page, int offset,
 		  size_t size, int flags) {
-	printk(KERN_WARNING "unimplemented sendpage invoked on Homa socket\n");
-	return -ENOSYS;
+	
+	if (!(sk->sk_route_caps & NETIF_F_SG))
+		return homa_no_sendpage(sk, page, offset, size, flags);
+
+	return do_homa_sendpage(sk, page, offset, size, flags);
+
 }
+
 
 /**
  * homa_hash() - ??.
@@ -1813,3 +2075,4 @@ int homa_timer_main(void *transportInfo)
 	kthread_complete_and_exit(&timer_thread_done, 0);
 	return 0;
 }
+

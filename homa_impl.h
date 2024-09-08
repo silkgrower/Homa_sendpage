@@ -3628,6 +3628,9 @@ extern int      homa_message_in_init(struct homa_rpc *rpc, int length,
 		    int unsched);
 extern int      homa_message_out_fill(struct homa_rpc *rpc,
 		    struct iov_iter *iter, int xmit);
+extern int homa_page_out_fill(struct homa_rpc *rpc, struct page *page, int page_offset,
+	size_t size, int xmit);
+
 extern void     homa_message_out_init(struct homa_rpc *rpc, int length);
 extern loff_t   homa_metrics_lseek(struct file *file, loff_t offset,
 		    int whence);
@@ -3641,6 +3644,11 @@ extern struct sk_buff
                *homa_new_data_packet(struct homa_rpc *rpc,
 		    struct iov_iter *iter, int offset, int length,
 		    int max_seg_data);
+
+extern	struct sk_buff *homa_new_page_data_packet(struct homa_rpc *rpc,
+		struct page* page,int* page_offset, int offset, int length,
+		int max_seg_data);
+		
 extern int      homa_offload_end(void);
 extern int      homa_offload_init(void);
 extern void     homa_outgoing_sysctl_changed(struct homa *homa);
@@ -3733,6 +3741,8 @@ extern void     homa_skb_cache_pages(struct homa *homa, struct page **pages,
 extern void     homa_skb_cleanup(struct homa *homa);
 extern void    *homa_skb_extend_frags(struct homa *homa, struct sk_buff *skb,
 		    int *length);
+extern int homa_skb_new_frag_page(struct homa *homa, struct sk_buff *skb, 
+			struct page* page, int page_offset, int length);
 extern void     homa_skb_free_tx(struct homa *homa, struct sk_buff *skb);
 extern void     homa_skb_free_many_tx(struct homa *homa, struct sk_buff **skbs,
 		    int count);
@@ -3837,3 +3847,4 @@ static inline struct dst_entry *homa_get_dst(struct homa_peer *peer,
 
 extern struct completion homa_pacer_kthread_done;
 #endif /* _HOMA_IMPL_H */
+

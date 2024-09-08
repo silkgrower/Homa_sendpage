@@ -178,6 +178,44 @@ void *homa_skb_extend_frags(struct homa *homa, struct sk_buff *skb, int *length)
 	return result;
 }
 
+
+/**
+ * homa_skb_new_frag_page() - Allocate additional space in the frags part
+ * of an skb ( by just expanding the last fragment). Returns
+ * one contiguous chunk, whose size is <= @length.
+ * @homa:     Overall data about the Homa protocol implementation.
+ * @skb:      Skbuff for which additional space is needed.
+ * @page:     Pointer to a memory page.
+ * @page_offset:  Specifies the starting position on the page from which data is sent. 
+ * @length:   The preferred number of bytes to append; modified to hold
+ *            the actual number allocated, which may be less.
+ * Return:    Pointer to the frag, or NULL if space couldn't be
+ *            allocated.
+ */
+int homa_skb_new_frag_page(struct homa *homa, struct sk_buff *skb, 
+struct page* page, int page_offset, int length)
+{
+	/*Retrieve the shared info of the skb.*/
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	skb_frag_t *frag;
+
+	/*Increment the reference count of the page to avoid it being freed prematurely.*/
+	get_page(page);
+
+	/*Get the current fragment based on the number of existing fragments.*/
+	frag = &shinfo->frags[shinfo->nr_frags];
+	shinfo->nr_frags++;
+
+	/*Set the page, start offset, and length for the fragment in the skb.*/
+	frag->bv_page = page;
+	frag->bv_offset = page_offset;
+	frag->bv_len = length;
+
+	skb_len_add(skb, length);
+	return 0;
+}
+
+
 /**
  * homa_skb_page_alloc() - Allocate a new page for skb allocation for a
  * given core. Any existing page is released.
@@ -306,6 +344,7 @@ int homa_skb_append_from_iter(struct homa *homa, struct sk_buff *skb,
 	}
 	return 0;
 }
+
 
 /**
  * homa_skb_append_from_skb() - Copy data from one skb to another. The

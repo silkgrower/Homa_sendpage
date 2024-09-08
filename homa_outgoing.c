@@ -160,6 +160,123 @@ struct sk_buff *homa_new_data_packet(struct homa_rpc *rpc,
 	return ERR_PTR(err);
 }
 
+
+/**
+ * homa_new_page_data_packet() - Allocate a new sk_buff and fill it with a Homa
+ * data packet. The resulting packet will be a TSO packet that will eventually
+ * be segmented by the NIC.
+ * @rpc:          RPC that packet will belong to (msgout must have been
+ *                initialized).
+ * @page:   	  Pointer to a memory page.
+ * @page_offset:  Specifies the starting position on the page from which data is sent. 
+*				  Use pointer to update current offset.
+ * @offset:       Offset in the message of the first byte of data in this
+ *                packet.
+ * @length:       How many bytes of data to include in the skb. Caller must
+ *                ensure that this amount of data isn't too much for a
+ *                well-formed TSO packet, and that iter has at least this
+ *                much data.
+ * @max_seg_data: Maximum number of bytes of message data that can go in
+ *                a single segment of the TSO packet.
+ * Return: A pointer to the new packet, or a negative errno.
+ */
+struct sk_buff *homa_new_page_data_packet(struct homa_rpc *rpc,
+		struct page* page,int* page_offset, int offset, int length,
+		int max_seg_data)
+{
+	struct data_header *h;
+	struct sk_buff *skb;
+	struct homa_skb_info *homa_info;
+	int segs, bytes_left, err;
+
+	/* Initialize the overall skb. */
+	skb = homa_skb_new_tx(sizeof32(struct data_header)
+			- sizeof32(struct data_segment));
+	if (!skb)
+		return ERR_PTR(-ENOMEM);
+
+	/* Fill in the Homa header (which will be replicated in every
+	 * network packet by GSO/TSO).
+	 */
+	h = (struct data_header *) skb_put(skb,
+			sizeof(*h) - sizeof(struct data_segment));
+	h->common.sport = htons(rpc->hsk->port);
+	h->common.dport = htons(rpc->dport);
+	h->common.sequence = 0;
+	h->common.type = DATA;
+	homa_set_doff(h);
+	h->common.flags = HOMA_TCP_FLAGS;
+	h->common.checksum = 0;
+	h->common.urgent = htons(HOMA_TCP_URGENT);
+	h->common.sender_id = cpu_to_be64(rpc->id);
+	h->message_length = htonl(rpc->msgout.length);
+	h->incoming = htonl(rpc->msgout.unscheduled);
+	h->cutoff_version = rpc->peer->cutoff_version;
+	h->retransmit = 0;
+	homa_info = homa_get_skb_info(skb);
+	homa_info->next_skb = NULL;
+	homa_info->wire_bytes = 0;
+	homa_info->data_bytes = 0;
+	homa_info->offset = offset;
+
+	/* Each iteration of the following loop adds one segment
+	 * (which will become a separate packet after GSO) to the skb.
+	 */
+	bytes_left = length;
+	segs = 0;
+	homa_skb_stash_pages(rpc->hsk->homa, length);
+	do {
+		int seg_size;
+		struct data_segment seg;
+		seg.offset = htonl(offset);
+		if (bytes_left <= max_seg_data)
+			seg_size = bytes_left;
+		else
+			seg_size = max_seg_data;
+		seg.segment_length = htonl(seg_size);
+		seg.ack.client_id = 0;
+		homa_peer_get_acks(rpc->peer, 1, &seg.ack);
+		err = homa_skb_append_to_frag(rpc->hsk->homa, skb, &seg,
+				sizeof(seg));
+		if (err != 0)
+			goto error;
+		/*Add date for skb*/
+		err = homa_skb_new_frag_page(rpc->hsk->homa, skb, page,*page_offset,
+				seg_size);
+		if (err != 0)
+			goto error;
+		bytes_left -= seg_size;
+		segs++;
+		homa_info->wire_bytes += seg_size + sizeof(struct data_segment)
+				+ sizeof(struct data_header)
+				+  rpc->hsk->ip_header_length
+				+ HOMA_ETH_OVERHEAD;
+		homa_info->data_bytes += seg_size;
+		offset += seg_size;
+		/*update the offset for page*/
+		*page_offset += seg_size;
+	} while (bytes_left > 0);
+
+	if (segs > 1)
+	{
+		skb_shinfo(skb)->gso_segs = segs;
+		skb_shinfo(skb)->gso_size = sizeof(struct data_segment)
+				+ max_seg_data;
+
+		/* It's unclear what gso_type should be used to force software
+		 * GSO; the value below seems to work...
+		 */
+		skb_shinfo(skb)->gso_type =
+		    rpc->hsk->homa->gso_force_software ? 0xd : SKB_GSO_TCPV6;
+	}
+	return skb;
+
+	error:
+	homa_skb_free_tx(rpc->hsk->homa, skb);
+	return ERR_PTR(err);
+}
+
+
 /**
  * homa_message_out_fill() - Initializes information for sending a message
  * for an RPC (either request or response); copies the message data from
@@ -293,6 +410,148 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit)
 	atomic_andnot(RPC_COPYING_FROM_USER, &rpc->flags);
 	return err;
 }
+
+/**
+ * homa_page_out_fill() - Initializes information for sending a message
+ * for an RPC (either request or response); copies the message data from
+ * user space and (possibly) begins transmitting the message.
+ * @rpc:     RPC for which to send message; this function must not
+ *           previously have been called for the RPC. Must be locked. The RPC
+ *           will be unlocked while copying data, but will be locked again
+ *           before returning.
+ * @page:    Pointer to a memory page.
+ * @page_offset: Specifies the starting position on the page from which data is sent.
+ * @size:    The size of the data to be sent
+ * @xmit:    Nonzero means this method should start transmitting packets;
+ *           transmission will be overlapped with copying from user space.
+ *           Zero means the caller will initiate transmission after this
+ *           function returns.
+ *
+ * Return:   0 for success, or a negative errno for failure. It is is possible
+ *           for the RPC to be freed while this function is active. If that
+ *           happens, copying will cease, -EINVAL will be returned, and
+ *           rpc->state will be RPC_DEAD.
+ */
+int homa_page_out_fill(struct homa_rpc *rpc, struct page *page, int page_offset,
+	size_t size, int xmit)
+{
+	/* Geometry information for packets:
+	 * mtu:              largest size for an on-the-wire packet (including
+	 *                   all headers through IP header, but not Ethernet
+	 *                   header).
+	 * max_seg_data:     largest amount of Homa message data that fits
+	 *                   in an on-the-wire packet (after segmentation).
+	 * max_gso_data:     largest amount of  Homa message data that fits
+	 *                   in a GSO packet (before segmentation).
+	 */
+	int mtu, max_seg_data, max_gso_data;
+
+	/* Bytes of the message that haven't yet been copied into skbs. */
+	int bytes_left;
+
+	int err;
+	struct sk_buff **last_link;
+	struct dst_entry *dst;
+	int overlap_xmit, segs_per_gso;
+	int gso_size;
+	
+	/*Initialize rpc*/
+	homa_message_out_init(rpc, size);
+	if (unlikely((rpc->msgout.length > HOMA_MAX_MESSAGE_LENGTH)
+			|| (rpc->msgout.length == 0))) {
+		tt_record2("homa_message_out_fill found bad length %d for id %d",
+				rpc->msgout.length, rpc->id);
+		err = -EINVAL;
+		goto error;
+	}
+
+	/* Compute the geometry of packets. */
+	dst = homa_get_dst(rpc->peer, rpc->hsk);
+	mtu = dst_mtu(dst);
+	max_seg_data = mtu - rpc->hsk->ip_header_length
+			- sizeof(struct data_header);
+	gso_size = dst->dev->gso_max_size;
+	if (gso_size > rpc->hsk->homa->max_gso_size)
+		gso_size = rpc->hsk->homa->max_gso_size;
+
+	/* Round gso_size down to an even # of mtus. */
+	segs_per_gso = (gso_size - rpc->hsk->ip_header_length
+			- sizeof(struct data_header))/max_seg_data;
+	if (segs_per_gso == 0)
+		segs_per_gso = 1;
+	max_gso_data = segs_per_gso * max_seg_data;
+	UNIT_LOG("; ", "mtu %d, max_seg_data %d, max_gso_data %d",
+			mtu, max_seg_data, max_gso_data);
+
+	overlap_xmit = rpc->msgout.length > 2*max_gso_data;
+	rpc->msgout.granted = rpc->msgout.unscheduled;
+	atomic_or(RPC_COPYING_FROM_USER, &rpc->flags);
+
+	/* Each iteration of the loop below creates one GSO packet. */
+	tt_record3("starting copy from user space for id %d, length %d, "
+			"unscheduled %d",
+			rpc->id, rpc->msgout.length, rpc->msgout.unscheduled);
+	last_link = &rpc->msgout.packets;
+	for (bytes_left = rpc->msgout.length; bytes_left > 0; ) {
+		int skb_data_bytes, offset;
+		struct sk_buff *skb;
+
+		homa_rpc_unlock(rpc);
+		skb_data_bytes = max_gso_data;
+		offset = rpc->msgout.length - bytes_left;
+		if ((offset < rpc->msgout.unscheduled) &&
+				((offset + skb_data_bytes)
+				> rpc->msgout.unscheduled)) {
+			/* Insert a packet boundary at the unscheduled limit,
+			 * so we don't transmit extra data.
+			 */
+			skb_data_bytes = rpc->msgout.unscheduled - offset;
+		}
+		if (skb_data_bytes > bytes_left)
+			skb_data_bytes = bytes_left;
+
+		/*Generate skb*/
+		skb = homa_new_page_data_packet(rpc, page, &page_offset, offset, 
+				skb_data_bytes,	max_seg_data);
+		if (unlikely(!skb)) {
+			err = PTR_ERR(skb);
+			homa_rpc_lock(rpc, "homa_page_out_fill");
+			goto error;
+		}
+		bytes_left -= skb_data_bytes;
+
+		homa_rpc_lock(rpc, "homa_page_out_fill2");
+		if (rpc->state == RPC_DEAD) {
+			/* RPC was freed while we were copying. */
+			err = -EINVAL;
+			homa_skb_free_tx(rpc->hsk->homa, skb);
+			goto error;
+		}
+		*last_link = skb;
+		last_link = &(homa_get_skb_info(skb)->next_skb);
+		*last_link = NULL;
+		rpc->msgout.num_skbs++;
+		rpc->msgout.copied_from_user = rpc->msgout.length - bytes_left;
+		if (overlap_xmit && list_empty(&rpc->throttled_links) && xmit
+				&& (offset < rpc->msgout.granted)) {
+			tt_record1("waking up pacer for id %d", rpc->id);
+			homa_add_to_throttled(rpc);
+		}
+	}
+	tt_record2("finished copy from page for id %d, length %d",
+			rpc->id, rpc->msgout.length);
+	atomic_andnot(RPC_COPYING_FROM_USER, &rpc->flags);
+	INC_METRIC(sent_msg_bytes, rpc->msgout.length);
+	if (!overlap_xmit && xmit)
+		homa_xmit_data(rpc, false);
+	return 0;
+
+    error:
+	atomic_andnot(RPC_COPYING_FROM_USER, &rpc->flags);
+	return err;
+}
+
+
 
 /**
  * homa_xmit_control() - Send a control packet to the other end of an RPC.
@@ -1022,3 +1281,4 @@ void homa_log_throttled(struct homa *homa)
 	printk(KERN_NOTICE "Finished printing throttle list: %d rpcs, "
 			"%lld bytes\n", rpcs, bytes);
 }
+
