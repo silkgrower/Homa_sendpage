@@ -883,127 +883,54 @@ int homa_getsockopt(struct sock *sk, int level, int optname,
  * Return: 0 on success, otherwise a negative errno.
  */
 int homa_sendmsg(struct sock *sk, struct msghdr *msg, size_t length) {
-	struct homa_sock *hsk = homa_sk(sk);
-	struct homa_sendmsg_args args;
-	__u64 start = get_cycles();
-	__u64 finish;
-	int result = 0;
-	struct homa_rpc *rpc = NULL;
-	sockaddr_in_union *addr = (sockaddr_in_union *) msg->msg_name;
+	printk(KERN_INFO"Test sendpage from homa_sendmsg");
 
-	homa_cores[raw_smp_processor_id()]->last_app_active = start;
-	if (unlikely(!msg->msg_control_is_user)) {
-		tt_record("homa_sendmsg error: !msg->msg_control_is_user");
-		result = -EINVAL;
-		goto error;
+	//Extract the target IP and port from the msg and copy them into the sock.
+    struct sockaddr *addr = msg->msg_name;
+
+    if (addr->sa_family == AF_INET) {  
+        struct sockaddr_in *addr_in = (struct sockaddr_in *) addr;
+        inet_sk(sk)->inet_dport = addr_in->sin_port; 
+        inet_sk(sk)->inet_daddr = addr_in->sin_addr.s_addr;  
+
+        sk->sk_family = AF_INET;  
+    } else if (addr->sa_family == AF_INET6) { 
+        struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *) addr;
+        sk->sk_dport = ntohs(addr_in6->sin6_port);  
+        memcpy(&inet6_sk(sk)->saddr, &addr_in6->sin6_addr, sizeof(struct in6_addr)); 
+
+        sk->sk_family = AF_INET6;  
+    } else {
+        printk(KERN_INFO "Unsupported address family: %d\n", addr->sa_family);
+		return -EAFNOSUPPORT;
+    }
+
+	// construct a page
+	struct page *page;
+  
+    page = alloc_pages(GFP_KERNEL, 0);
+	    if (!page) {
+        printk(KERN_ERR "Cannot allocate memory page\n");
+        return -ENOMEM;
+    	}
+	
+	int result;
+	int offset = 0; 
+	size_t size = PAGE_SIZE; 
+	int flags = 0;  
+
+	//call homa_sendpage function
+	result = homa_sendpage(sk, page, offset, size, flags);
+	__free_pages(page, 0);  
+
+	if (result < 0) {
+    printk(KERN_ERR "homa_sendpage failed: %d\n", result);
+    return result;
 	}
-	if (unlikely(copy_from_user(&args, msg->msg_control,
-			sizeof(args)))) {
-		result = -EFAULT;
-		goto error;
-	}
-	if (addr->in6.sin6_family != sk->sk_family) {
-		result = -EAFNOSUPPORT;
-		goto error;
-	}
-	if ((msg->msg_namelen < sizeof(struct sockaddr_in))
-			|| ((msg->msg_namelen < sizeof(struct sockaddr_in6))
-			&& (addr->in6.sin6_family == AF_INET6))) {
-		tt_record("homa_sendmsg error: msg_namelen too short");
-		result = -EINVAL;
-		goto error;
-	}
 
-	if (!args.id) {
-		/* This is a request message. */
-		rpc = homa_rpc_new_client(hsk, addr);
-		if (IS_ERR(rpc)) {
-			result = PTR_ERR(rpc);
-			rpc = NULL;
-			goto error;
-		}
-		INC_METRIC(send_calls, 1);
-		tt_record4("homa_sendmsg request, target 0x%x:%d, id %u, length %d",
-				(addr->in6.sin6_family == AF_INET)
-				? ntohl(addr->in4.sin_addr.s_addr)
-				: tt_addr(addr->in6.sin6_addr),
-				ntohs(addr->in6.sin6_port), rpc->id,
-				length);
-		rpc->completion_cookie = args.completion_cookie;
-		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
-		if (result)
-			goto error;
-		args.id = rpc->id;
-		homa_rpc_unlock(rpc);
-		rpc = NULL;
-
-		if (unlikely(copy_to_user(msg->msg_control, &args,
-				sizeof(args)))) {
-			rpc = homa_find_client_rpc(hsk, args.id);
-			result = -EFAULT;
-			goto error;
-		}
-		finish = get_cycles();
-		INC_METRIC(send_cycles, finish - start);
-	} else {
-		/* This is a response message. */
-		struct in6_addr canonical_dest;
-
-		INC_METRIC(reply_calls, 1);
-		tt_record4("homa_sendmsg response, id %llu, port %d, pid %d, length %d",
-				args.id, hsk->port, current->pid, length);
-		if (args.completion_cookie != 0) {
-			tt_record("homa_sendmsg error: nonzero cookie");
-			result = -EINVAL;
-			goto error;
-		}
-		canonical_dest = canonical_ipv6_addr(addr);
-
-		rpc = homa_find_server_rpc(hsk, &canonical_dest,
-				ntohs(addr->in6.sin6_port), args.id);
-		if (!rpc) {
-			/* Return without an error if the RPC doesn't exist;
-			 * this could be totally valid (e.g. client is
-			 * no longer interested in it).
-			 */
-			tt_record2("homa_sendmsg error: RPC id %d, peer 0x%x, "
-					"doesn't exist", args.id,
-					tt_addr(canonical_dest));
-			return 0;
-		}
-		if (rpc->error) {
-			result = rpc->error;
-			goto error;
-		}
-		if (rpc->state != RPC_IN_SERVICE) {
-			tt_record2("homa_sendmsg error: RPC id %d in bad "
-					"state %d", rpc->id, rpc->state);
-			homa_rpc_unlock(rpc);
-			rpc = 0;
-			result = -EINVAL;
-			goto error;
-		}
-		rpc->state = RPC_OUTGOING;
-
-		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
-		if (result && (rpc->state != RPC_DEAD))
-			goto error;
-		homa_rpc_unlock(rpc);
-		finish = get_cycles();
-		INC_METRIC(reply_cycles, finish - start);
-	}
-	tt_record1("homa_sendmsg finished, id %d", args.id);
+	printk(KERN_INFO"homa_sendmsg done, sendpage success!");
 	return 0;
 
-error:
-	if (rpc) {
-		homa_rpc_free(rpc);
-		homa_rpc_unlock(rpc);
-	}
-	tt_record2("homa_sendmsg returning error %d for id %d",
-			result, args.id);
-	tt_freeze();
-	return result;
 }
 
 
@@ -1172,7 +1099,9 @@ int homa_no_sendpage(struct sock *sk, struct page *page, int offset,
 	__u64 finish;
 	int result = 0;
 	struct homa_rpc *rpc = NULL;
-
+	
+	printk(KERN_INFO"start homa_no_sendpage\n");
+	
 	// Set addr struct
 	sockaddr_in_union *addr = kmalloc(sizeof(sockaddr_in_union), GFP_KERNEL);
     if (!addr) {
@@ -1275,7 +1204,11 @@ int homa_no_sendpage(struct sock *sk, struct page *page, int offset,
     	addr = NULL; 
 	}
 	tt_record1("homa_sendpage finished, id %d", args.id);
+	printk(KERN_INFO"homa_no_sendpage success\n");
+	
 	return 0;
+
+
 
 error:
 	if (rpc) {
@@ -1311,6 +1244,8 @@ int do_homa_sendpage(struct sock *sk, struct page *page, int offset,
 	__u64 finish;
 	int result = 0;
 	struct homa_rpc *rpc = NULL;
+
+	printk(KERN_INFO"start do_homa_sendpage\n");
 
 	// Set addr struct
 	sockaddr_in_union *addr = kmalloc(sizeof(sockaddr_in_union), GFP_KERNEL);
@@ -1388,6 +1323,8 @@ int do_homa_sendpage(struct sock *sk, struct page *page, int offset,
     	addr = NULL; 
 	}
 	tt_record1("homa_sendpage finished, id %d", args.id);
+
+	printk(KERN_INFO"do_homa_sendpage success\n");
 	return 0;
 
 error:
@@ -1418,10 +1355,15 @@ error:
  */
 int homa_sendpage(struct sock *sk, struct page *page, int offset,
 		  size_t size, int flags) {
-	
-	if (!(sk->sk_route_caps & NETIF_F_SG))
-		return homa_no_sendpage(sk, page, offset, size, flags);
 
+	printk(KERN_INFO"start homa_sendpage\n");
+	if (!(sk->sk_route_caps & NETIF_F_SG))
+	{
+		printk(KERN_INFO"Not support scatter-gather I/O\n");
+		return homa_no_sendpage(sk, page, offset, size, flags);
+	}
+		
+	printk(KERN_INFO"Support scatter-gather I/O\n");
 	return do_homa_sendpage(sk, page, offset, size, flags);
 
 }

@@ -189,6 +189,8 @@ struct sk_buff *homa_new_page_data_packet(struct homa_rpc *rpc,
 	struct homa_skb_info *homa_info;
 	int segs, bytes_left, err;
 
+	printk(KERN_INFO"start homa_new_page_data_packet\n");
+	
 	/* Initialize the overall skb. */
 	skb = homa_skb_new_tx(sizeof32(struct data_header)
 			- sizeof32(struct data_segment));
@@ -269,6 +271,7 @@ struct sk_buff *homa_new_page_data_packet(struct homa_rpc *rpc,
 		skb_shinfo(skb)->gso_type =
 		    rpc->hsk->homa->gso_force_software ? 0xd : SKB_GSO_TCPV6;
 	}
+	printk(KERN_INFO"homa_new_page_data_packet success\n");
 	return skb;
 
 	error:
@@ -455,6 +458,8 @@ int homa_page_out_fill(struct homa_rpc *rpc, struct page *page, int page_offset,
 	int overlap_xmit, segs_per_gso;
 	int gso_size;
 	
+	printk(KERN_INFO"start homa_page_out_fill\n");
+
 	/*Initialize rpc*/
 	homa_message_out_init(rpc, size);
 	if (unlikely((rpc->msgout.length > HOMA_MAX_MESSAGE_LENGTH)
@@ -544,6 +549,8 @@ int homa_page_out_fill(struct homa_rpc *rpc, struct page *page, int page_offset,
 	INC_METRIC(sent_msg_bytes, rpc->msgout.length);
 	if (!overlap_xmit && xmit)
 		homa_xmit_data(rpc, false);
+
+	printk(KERN_INFO"homa_page_out_fill success\n");
 	return 0;
 
     error:

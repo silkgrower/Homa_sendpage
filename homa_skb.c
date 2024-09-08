@@ -199,6 +199,8 @@ struct page* page, int page_offset, int length)
 	struct skb_shared_info *shinfo = skb_shinfo(skb);
 	skb_frag_t *frag;
 
+	printk(KERN_INFO"start homa_skb_new_frag_page\n");
+	
 	/*Increment the reference count of the page to avoid it being freed prematurely.*/
 	get_page(page);
 
@@ -212,6 +214,9 @@ struct page* page, int page_offset, int length)
 	frag->bv_len = length;
 
 	skb_len_add(skb, length);
+
+	printk(KERN_INFO"homa_skb_new_frag_page current page offset is %d\n", page_offset);
+	printk(KERN_INFO"homa_skb_new_frag_page success\n");
 	return 0;
 }
 
