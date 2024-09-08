@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# Copyright (c) 2020-2023 Homa Developers
+# SPDX-License-Identifier: BSD-1-Clause
+
+# Kill processes with a given name on a cluster of machines.
+#
+# Usage:
+# ckill name num_nodes [first]
+#
+# "name" gives the name of the process to be killed (suitable as an
+# argument to "pidof"). The "num_nodes" arguments indicates how many
+# servers should be examined for processes to kill. The "first" argument
+# is optional; it is an integer identifying the first node on which
+# killing will occur (e.g. "ckill cp_node 4 2" means node2 through node5 will be
+# updated will be searched. "first" defaults to 0.
+
+root=~/homaModule
+
+if [ $# -eq 3 ]; then
+    first=$3
+elif [ $# -eq 2 ]; then
+    first=0
+else
+    echo "Usage: ckill name num_nodes [first]"
+    exit 1
+fi
+last=`expr $first + $2 - 1`
+
+for ((i = $first ; i <= $last; i++)); do
+    node=node$i
+    echo "ssh node$i 'kill \`pidof $1\`'"
+    ssh node$i "kill \`pidof $1\`"
+done
